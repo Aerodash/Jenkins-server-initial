@@ -1,0 +1,22 @@
+{
+  "name": "jenkins-client-server",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "start": "node_modules/.bin/nodemon index"
+  },
+  "author": "Ahmed Moalla",
+  "license": "ISC",
+  "dependencies": {
+    "cors": "^2.8.3",
+    "express": "4.15.3",
+    "request": "^2.81.0",
+    "socket.io": "^2.0.3",
+    "uuid": "^3.1.0"
+  },
+  "devDependencies": {
+    "nodemon": "^1.11.0",
+    "opn": "^5.1.0"
+  }
+}
