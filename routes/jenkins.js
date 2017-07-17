@@ -205,11 +205,17 @@ class JenkinsService {
             
             let interval = setInterval(() => {
                 this.buildStatus(job.name, (buildResponse) => {
-                    const resp = JSON.parse(buildResponse.toString());
+                    let resp = {};
+                    if (buildResponse.toString().indexOf('404') != -1) {
+                        resp.id = -1;
+                    } else {
+                        resp = JSON.parse(buildResponse.toString());
+                    }
+                        
                     const result = resp.result;
                     const d = new Date()
                     if (!result) noop();//console.log(`[${d.getHours()}:${d.getMinutes()}:${d.getSeconds()}] IN PROGRESS`);
-                    else if (resp.id != latestBuildId) { // Not previous build id (Current build might be in queue)
+                    else if (resp.id == -1 || resp.id != latestBuildId) { // Not previous build id (Current build might be in queue)
                         callback(result);
                         clearInterval(interval);
                     }
@@ -217,10 +223,16 @@ class JenkinsService {
             }, checkInterval);
         };
         this.buildStatus(job.name, (previousBuildResponse) => {
-            const previousResp = JSON.parse(previousBuildResponse.toString());
-            let latestBuildId = previousResp.id;
-            
-            if (job.params.length == 0) {
+
+            let latestBuildId;
+            let previousResp;
+            if (previousBuildResponse.toString().indexOf('404') != -1) latestBuildId = -1;
+            else {
+                previousResp = JSON.parse(previousBuildResponse.toString());
+                latestBuildId = previousResp.id;
+            }
+
+            if (job.params == undefined || job.params == null || job.params.length == 0) {
                 this.buildJob(job.name, (response) => afterBuild(response, latestBuildId));
             } else {
                 // FORMAT JOB PARAMS
@@ -233,8 +245,14 @@ class JenkinsService {
         });
     }
 
-    buildJobs(jobs, emitter = new FlowStatusEmitter(), index = 0) {
-        
+    isFlowStarted(flowName) {
+
+    }
+
+    buildJobs(flow, emitter = new FlowStatusEmitter(), index = 0) {
+        let jobs = flow.flow;
+        // Set parameters into job objects
+
         if (!this.flowStarted) {
             emitter.emit('flow-update', new JobStatus(FLOW_START, "", "OK"));
             this.flowStarted = true;
@@ -283,6 +301,79 @@ class JenkinsService {
                     this.flowStarted = false; 
                 } else 
                     this.buildJobs(jobs, emitter, index + 1);
+            })
+        }
+        
+        return emitter;
+    }
+
+    buildFlow(flow, emitter = new FlowStatusEmitter(), index = 0) {
+        let jobs = flow.flow;
+        // Set parameters into job objects
+        for (let i = 0; i < jobs.length; i++) {
+            if (jobs[i] instanceof Array) {
+                for (let j = 0; j < jobs[i].length; j++) {
+                    if (jobs[i][j].params == undefined || jobs[i][j].params == null) continue;
+                    for (let k = 0; k < jobs[i][j].params.length; k++) {
+                        jobs[i][j].params[k].value = flow.parameters[jobs[i][j].params[k].name].value;
+                    }
+                }
+            } else {
+                if (jobs[i].params == undefined || jobs[i].params == null) continue;
+                for (let k = 0; k < jobs[i].params.length; k++) {
+                    jobs[i].params[k].value = flow.parameters[jobs[i].params[k].name].value;
+                }
+            }
+        }
+    /*
+        if (flowStarted) {
+            emitter.emit('flow-update', new JobStatus(FLOW_START, "", "OK"));
+            flowStarted = true;
+        }*/
+        
+        if (jobs[index] instanceof Array) { // parallel jobs
+            let parallelJobs = jobs[index];
+            emitter.emit('flow-update', new JobStatus(JOB_INFO, { jobs: parallelJobs, index }, PARALLEL_BUILD));
+
+            let parallelJobsStatus = [];
+            jobs[index].forEach((elt) => parallelJobsStatus.push(false));
+            
+            for (let i = 0; i < parallelJobs.length; i++) {
+                emitter.emit('flow-update', new JobStatus(PARALLEL_JOB_START, { jobs: parallelJobs[i].name, index, j: i, params: parallelJobs[i].params }, "OK"));
+                this.buildJobAndWait(parallelJobs[i], (result) => {
+                    emitter.emit('flow-update', new JobStatus(PARALLEL_JOB_END, { jobs: parallelJobs[i].name, index, j: i }, result));
+                    
+                    if (result != "SUCCESS") {
+                        emitter.emit('flow-update', new JobStatus(FLOW_END, parallelJobs[i].name, result));
+                        flowStarted = false;
+                        return;
+                    }
+
+                    parallelJobsStatus[i] = true;
+                    if (parallelJobsStatus.indexOf(false) == -1 && index + 1 < jobs.length) {
+                        this.buildJobs(flow, emitter, index + 1);
+                    } else if (parallelJobsStatus.indexOf(false) == -1 && index + 1 == jobs.length){
+                        emitter.emit('flow-update', new JobStatus(FLOW_END, "", result));
+                        flowStarted = false;
+                    }
+                })
+            }
+        } else {
+            emitter.emit('flow-update', new JobStatus(JOB_START, { jobs: jobs[index].name, index, params: jobs[index].params }, "OK"));
+            this.buildJobAndWait(jobs[index], (result) => {
+                emitter.emit('flow-update', new JobStatus(JOB_END, { jobs: jobs[index].name, index }, result));
+
+                if (result != "SUCCESS") {
+                    emitter.emit('flow-update', new JobStatus(FLOW_END, jobs[index].name, result));
+                    flowStarted = false;
+                    return;
+                }
+
+                if ((index + 1) == jobs.length) {
+                    emitter.emit('flow-update', new JobStatus(FLOW_END, "", result));
+                    flowStarted = false; 
+                } else 
+                    this.buildJobs(flow, emitter, index + 1);
             })
         }
         
