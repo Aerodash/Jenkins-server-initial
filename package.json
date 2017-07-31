@@ -4,7 +4,7 @@
   "description": "",
   "main": "index.js",
   "scripts": {
-    "start": "node_modules/.bin/nodemon index"
+    "start": "node index"
   },
   "author": "Ahmed Moalla",
   "license": "ISC",

@@ -1,7 +1,9 @@
 const request = require('request');
 const EventEmitter = require('events');
+const fs = require('fs');
+const Config = require('../jenkins.config');
 
-const ROOT_URL = 'http://localhost:8080'
+const ROOT_URL = Config.url || 'http://localhost:8080'
 const API = '/api/json';
 const CRUMB = '/crumbIssuer/api/xml?xpath=concat(//crumbRequestField,":",//crumb)';
 const CRUMB_HEADER = 'Jenkins-Crumb';
@@ -30,23 +32,39 @@ class JobStatus {
         this.status = status;
     }
 }
-
+var emittedBuildIds = [];
 class JenkinsService {
     
     constructor(/*{ url, username, password }*/) {
         this.url = /*url ||*/ ROOT_URL;
-        this.username =  'ahmedmoalla';
-        this.password = '98578652';
+        this.username =  Config.username;
+        this.password = Config.password;
         this.generateCrumb((crumb) => this.crumb = crumb);  
-        this.flowStarted = false;
+    }
+
+    isJenkinsRunning(callback) {
+        request.get(ROOT_URL)
+        .auth(this.username, this.password)
+        .on('response', (response) => {
+            callback({ status: response.statusMessage });
+        }).on('error', error => {
+            if (error.code == 'ECONNREFUSED'){
+                callback({ status: error.code });
+            }
+        })
     }
 
     generateCrumb(callback) {
         request.get(ROOT_URL + CRUMB)
-            .auth(this.username, this.password)
-            .on('data', (data) => {
-                callback(data.toString().split(':')[1]);
-            });
+        .auth(this.username, this.password)
+        .on('data', (data) => {
+            callback(data.toString().split(':')[1]);
+        }).on('error', (e)=> {
+            if (e.code == 'ECONNREFUSED') {
+                console.log('Unable to connect to Jenkins. Trying again...');
+                setTimeout(() => this.generateCrumb(callback), 1000);
+            }
+        });
     }
     
     createJob(name, config, callback) {   
@@ -111,6 +129,36 @@ class JenkinsService {
                     console.log(e);
                 }
             })
+    }
+
+    jobBuildInfo(name, buildNumber, callback) {
+        request.get(ROOT_URL + JOB(name) + '/' + buildNumber + API)
+            .auth(this.username, this.password)
+            .on('data', (data) => {
+                let info;
+                try {
+                    info = JSON.parse(data.toString());
+                    callback(info);
+                } catch(e) {
+                    this.jobBuildInfo(name, callback);
+                    console.log(e);
+                }
+            })
+    }
+
+    jobBuildLogs(name, buildNumber, callback) {
+        let logs;
+        request.get(ROOT_URL + JOB(name) + '/' + buildNumber + '/consoleText')
+            .auth(this.username, this.password)
+            .on('data', (data) => {
+                try {
+                    logs += data.toString();
+                } catch(e) {
+                    this.jobBuildLogs(name, callback);
+                    console.log(e);
+                }
+            })
+            .on('end', () => callback(logs))
     }
 
     deleteJob(name, callback) {
@@ -196,7 +244,7 @@ class JenkinsService {
         }
     }
 
-    buildJobAndWait(job, callback, checkInterval = 500) {
+    buildJobAndWait(job, emitter, callback, checkInterval = 250) {
         let noop = () => {};
         let afterBuild = (response, latestBuildId) => {
             if (response.statusCode != 201) {
@@ -214,9 +262,24 @@ class JenkinsService {
                         
                     const result = resp.result;
                     const d = new Date()
-                    if (!result) noop();//console.log(`[${d.getHours()}:${d.getMinutes()}:${d.getSeconds()}] IN PROGRESS`);
+                    
+                    if (!result && resp.id != latestBuildId && resp.id != -1) {
+                        //console.log(job.name, resp.id); // Emit build id here !
+                        let exists = false;
+                        for (let i = 0; i < emittedBuildIds.length; i++) {
+                            if (emittedBuildIds[i].name == job.name && emittedBuildIds[i].build == resp.id) {
+                                exists = true;
+                                break;
+                            }
+                        }
+                        if (!exists) {
+                            emittedBuildIds.push({ name: job.name, build: resp.id });
+                            emitter.emit('flow-update[' + job.flowName + ']', new JobStatus('JOB_START_INFO', { jobs: job.name, build: resp.id, i: job.i, j: job.j }, "OK"));
+                        }
+                    }
+                    else if (!result) noop();//console.log(`[${d.getHours()}:${d.getMinutes()}:${d.getSeconds()}] IN PROGRESS`);
                     else if (resp.id == -1 || resp.id != latestBuildId) { // Not previous build id (Current build might be in queue)
-                        callback(result);
+                        callback(result, resp.id);
                         clearInterval(interval);
                     }
                 })
@@ -228,6 +291,7 @@ class JenkinsService {
             let previousResp;
             if (previousBuildResponse.toString().indexOf('404') != -1) latestBuildId = -1;
             else {
+                console.log(previousBuildResponse.toString())
                 previousResp = JSON.parse(previousBuildResponse.toString());
                 latestBuildId = previousResp.id;
             }
@@ -244,9 +308,17 @@ class JenkinsService {
             }
         });
     }
+    
+    isFlowRunning(flowName) {
+        const data = fs.readFileSync('storage/' + flowName + '/_.json');
+        return !!JSON.parse(data.toString()).isRunning;
+    }
 
-    isFlowStarted(flowName) {
-
+    setFlowRunning(flowName, value) {
+        const data = fs.readFileSync('storage/' + flowName + '/_.json');
+        const flow = JSON.parse(data.toString());
+        flow.isRunning = value;
+        fs.writeFileSync('storage/' + flowName + '/_.json', JSON.stringify(flow));
     }
 
     buildJobs(flow, emitter = new FlowStatusEmitter(), index = 0) {
@@ -325,60 +397,67 @@ class JenkinsService {
                 }
             }
         }
-    /*
-        if (flowStarted) {
-            emitter.emit('flow-update', new JobStatus(FLOW_START, "", "OK"));
-            flowStarted = true;
-        }*/
+    
+        if (!this.isFlowRunning(flow.name)) {
+            emitter.emit('flow-update[' + flow.name + ']', new JobStatus(FLOW_START, flow.name, "OK"));
+            this.setFlowRunning(flow.name, true);
+        }
         
         if (jobs[index] instanceof Array) { // parallel jobs
             let parallelJobs = jobs[index];
-            emitter.emit('flow-update', new JobStatus(JOB_INFO, { jobs: parallelJobs, index }, PARALLEL_BUILD));
+            emitter.emit('flow-update[' + flow.name + ']', new JobStatus(JOB_INFO, { jobs: parallelJobs, index }, PARALLEL_BUILD));
 
             let parallelJobsStatus = [];
             jobs[index].forEach((elt) => parallelJobsStatus.push(false));
             
             for (let i = 0; i < parallelJobs.length; i++) {
-                emitter.emit('flow-update', new JobStatus(PARALLEL_JOB_START, { jobs: parallelJobs[i].name, index, j: i, params: parallelJobs[i].params }, "OK"));
-                this.buildJobAndWait(parallelJobs[i], (result) => {
-                    emitter.emit('flow-update', new JobStatus(PARALLEL_JOB_END, { jobs: parallelJobs[i].name, index, j: i }, result));
+                emitter.emit('flow-update[' + flow.name + ']', new JobStatus(PARALLEL_JOB_START, { jobs: parallelJobs[i].name, index, j: i, params: parallelJobs[i].params }, "OK"));
+                // Save flow name and position to emit inside buildJobAndWait
+                parallelJobs[i].flowName = flow.name;
+                parallelJobs[i].i = index;
+                parallelJobs[i].j = i;
+                this.buildJobAndWait(parallelJobs[i], emitter, (result, buildId) => {
+                    emitter.emit('flow-update[' + flow.name + ']', new JobStatus(PARALLEL_JOB_END, { jobs: parallelJobs[i].name, index, j: i, build: buildId }, result));
                     
                     if (result != "SUCCESS") {
-                        emitter.emit('flow-update', new JobStatus(FLOW_END, parallelJobs[i].name, result));
-                        flowStarted = false;
+                        emitter.emit('flow-update[' + flow.name + ']', new JobStatus(FLOW_END, parallelJobs[i].name, result));
+                        this.setFlowRunning(flow.name, false);
                         return;
                     }
 
                     parallelJobsStatus[i] = true;
                     if (parallelJobsStatus.indexOf(false) == -1 && index + 1 < jobs.length) {
-                        this.buildJobs(flow, emitter, index + 1);
+                        this.buildFlow(flow, emitter, index + 1);
                     } else if (parallelJobsStatus.indexOf(false) == -1 && index + 1 == jobs.length){
-                        emitter.emit('flow-update', new JobStatus(FLOW_END, "", result));
-                        flowStarted = false;
+                        emitter.emit('flow-update[' + flow.name + ']', new JobStatus(FLOW_END, "", result));
+                        this.setFlowRunning(flow.name, false);
                     }
                 })
             }
         } else {
-            emitter.emit('flow-update', new JobStatus(JOB_START, { jobs: jobs[index].name, index, params: jobs[index].params }, "OK"));
-            this.buildJobAndWait(jobs[index], (result) => {
-                emitter.emit('flow-update', new JobStatus(JOB_END, { jobs: jobs[index].name, index }, result));
+            emitter.emit('flow-update[' + flow.name + ']', new JobStatus(JOB_START, { jobs: jobs[index].name, index, params: jobs[index].params }, "OK"));
+            jobs[index].flowName = flow.name;
+            jobs[index].i = index;
+            this.buildJobAndWait(jobs[index], emitter, (result, buildId) => {
+                emitter.emit('flow-update[' + flow.name + ']', new JobStatus(JOB_END, { jobs: jobs[index].name, index, build: buildId }, result));
 
                 if (result != "SUCCESS") {
-                    emitter.emit('flow-update', new JobStatus(FLOW_END, jobs[index].name, result));
-                    flowStarted = false;
+                    emitter.emit('flow-update[' + flow.name + ']', new JobStatus(FLOW_END, jobs[index].name, result));
+                    this.setFlowRunning(flow.name, false);
                     return;
                 }
 
                 if ((index + 1) == jobs.length) {
-                    emitter.emit('flow-update', new JobStatus(FLOW_END, "", result));
-                    flowStarted = false; 
+                    emitter.emit('flow-update[' + flow.name + ']', new JobStatus(FLOW_END, "", result));
+                    this.setFlowRunning(flow.name, false); 
                 } else 
-                    this.buildJobs(flow, emitter, index + 1);
+                    this.buildFlow(flow, emitter, index + 1);
             })
         }
         
         return emitter;
     }
+
 }
 
 module.exports = JenkinsService;
